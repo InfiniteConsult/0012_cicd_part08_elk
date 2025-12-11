@@ -2,7 +2,7 @@
 
 #
 # -----------------------------------------------------------
-#               01-setup-elk.sh (Final Fixed)
+#               01-setup-elk.sh
 #
 #  The "Architect" script for the ELK Stack.
 #
@@ -72,7 +72,6 @@ fi
 
 # --- 3. Directory Setup ---
 echo "--- Phase 2: Directory Scaffolding ---"
-# Use sudo because previous runs might have owned these as root
 sudo mkdir -p "$ES_CONFIG_DIR/certs"
 sudo mkdir -p "$KIBANA_CONFIG_DIR/certs"
 sudo mkdir -p "$FILEBEAT_CONFIG_DIR/certs"
@@ -185,6 +184,7 @@ ingest.geoip.downloader.enabled: false
 EOF"
 
 # B. Kibana Configuration
+# We use \${VAR} to tell Docker to replace this at runtime from the env file
 sudo bash -c "cat << EOF > \"$KIBANA_CONFIG_DIR/kibana.yml\"
 server.host: \"0.0.0.0\"
 server.name: \"kibana.cicd.local\"
@@ -217,7 +217,8 @@ xpack.actions.preconfigured:
     name: \"Mattermost CI/CD Channel\"
     actionTypeId: .webhook
     config:
-      url: \"https://mattermost.cicd.local:8065/hooks/YOUR_HOOK_ID_HERE\"
+      # Maps to the env var we inject in kibana.env
+      url: \"\${MATTERMOST_WEBHOOK_URL}\"
       method: post
       hasAuth: false
 EOF"
@@ -315,6 +316,8 @@ ELASTICSEARCH_PASSWORD=$KIBANA_PASSWORD
 XPACK_SECURITY_ENCRYPTIONKEY=$XPACK_SECURITY_ENCRYPTIONKEY
 XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY=$XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY
 XPACK_REPORTING_ENCRYPTIONKEY=$XPACK_REPORTING_ENCRYPTIONKEY
+# NEW: Inject the webhook URL from master secrets
+MATTERMOST_WEBHOOK_URL=$SONAR_MATTERMOST_WEBHOOK
 EOF
 
 cat << EOF | sudo tee "$ELK_BASE/filebeat/filebeat.env" > /dev/null
@@ -326,17 +329,10 @@ echo "Fixing ownership of environment files for current user..."
 CURRENT_USER=$(id -u)
 CURRENT_GROUP=$(id -g)
 
-# Change ownership from root back to the host user so Docker CLI can read them
 sudo chown "$CURRENT_USER":"$CURRENT_GROUP" "$ELK_BASE"/elasticsearch/elasticsearch.env
 sudo chown "$CURRENT_USER":"$CURRENT_GROUP" "$ELK_BASE"/kibana/kibana.env
 sudo chown "$CURRENT_USER":"$CURRENT_GROUP" "$ELK_BASE"/filebeat/filebeat.env
 
-# Now set permissions to 600 (User Read/Write only)
 chmod 600 "$ELK_BASE"/*/*.env
 
 echo "✅ Setup Complete."
-echo "   - Kernel configured (Idempotent)."
-echo "   - Secrets generated."
-echo "   - Configs written to $ELK_BASE"
-echo "   - Certificates staged (UID 1000)."
-echo "   - Env files secured for user $(whoami)."
