@@ -248,6 +248,7 @@ xpack.actions.preconfigured:
 EOF
 
 # C. Filebeat Configuration
+# C. Filebeat Configuration
 cat << EOF > "$FILEBEAT_CONFIG_DIR/filebeat.yml"
 filebeat.inputs:
   # 1. Jenkins (Java Logs)
@@ -289,6 +290,32 @@ filebeat.inputs:
     paths:
       - /host_volumes/mattermost-logs/_data/mattermost.log
     fields: { service_name: "mattermost" }
+    fields_under_root: true
+
+  # 5. Artifactory (Service & Request Logs)
+  - type: filestream
+    id: artifactory
+    paths:
+      # Artifactory 7 structure: volume root (_data) -> log -> ...
+      - /host_volumes/artifactory-data/_data/log/artifactory-service.log
+      - /host_volumes/artifactory-data/_data/log/artifactory-request.log
+      - /host_volumes/artifactory-data/_data/log/access-service.log
+    fields: { service_name: "artifactory" }
+    fields_under_root: true
+    # Handle Java Stack Traces for service logs
+    multiline.type: pattern
+    multiline.pattern: '^\d{4}-\d{2}-\d{2}'
+    multiline.negate: true
+    multiline.match: after
+
+  # 6. Host System Logs (The Bedrock)
+  # Requires mounting /var/log to /host_system_logs in deploy script
+  - type: filestream
+    id: host-system
+    paths:
+      - /host_system_logs/syslog
+      - /host_system_logs/auth.log
+    fields: { service_name: "system" }
     fields_under_root: true
 
 # Output Direct to Elasticsearch
