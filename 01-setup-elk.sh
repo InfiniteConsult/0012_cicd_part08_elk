@@ -210,7 +210,6 @@ newsfeed.enabled: false
 map.includeElasticMapsService: false
 xpack.fleet.enabled: false
 xpack.apm.enabled: false
-xpack.ml.enabled: false
 
 xpack.actions.preconfigured:
   mattermost-webhook:
