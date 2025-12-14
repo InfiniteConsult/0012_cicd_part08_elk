@@ -191,17 +191,19 @@ EOF
 # This injects the ACTUAL password string into the file, bypassing Docker variable expansion issues.
 cat << EOF > "$FILEBEAT_CONFIG_DIR/filebeat.yml"
 filebeat.inputs:
-  # 1. Jenkins
-  - type: filestream
-    id: jenkins-logs
+  # 1. Host System Logs (Journald)
+  # Reads binary logs directly from /var/log/journal
+  - type: journald
+    id: host-system
     paths:
-      - /host_volumes/jenkins-home/_data/logs/jenkins.log
-    fields: { service_name: "jenkins" }
+      - /var/log/journal
+    include_matches:
+      - "systemd.unit=docker.service"
+      - "systemd.unit=sudo.service"
+      - "systemd.unit=ssh.service"
+      - "syslog.identifier=kernel"
+    fields: { service_name: "system" }
     fields_under_root: true
-    multiline.type: pattern
-    multiline.pattern: '^\d{4}-\d{2}-\d{2}'
-    multiline.negate: true
-    multiline.match: after
 
   # 2. GitLab Nginx
   - type: filestream
@@ -245,15 +247,6 @@ filebeat.inputs:
     multiline.pattern: '^\d{4}-\d{2}-\d{2}'
     multiline.negate: true
     multiline.match: after
-
-  # 6. Host System Logs
-  - type: filestream
-    id: host-system
-    paths:
-      - /host_system_logs/syslog
-      - /host_system_logs/auth.log
-    fields: { service_name: "system" }
-    fields_under_root: true
 
 output.elasticsearch:
   hosts: ["https://elasticsearch.cicd.local:9200"]
