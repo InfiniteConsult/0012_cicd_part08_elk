@@ -192,16 +192,11 @@ EOF
 cat << EOF > "$FILEBEAT_CONFIG_DIR/filebeat.yml"
 filebeat.inputs:
   # 1. Host System Logs (Journald)
-  # Reads binary logs directly from /var/log/journal
   - type: journald
     id: host-system
     paths:
       - /var/log/journal
-    include_matches:
-      - "systemd.unit=docker.service"
-      - "systemd.unit=sudo.service"
-      - "systemd.unit=ssh.service"
-      - "syslog.identifier=kernel"
+    # Filters removed to allow user-1000.journal logs to pass through
     fields: { service_name: "system" }
     fields_under_root: true
 
