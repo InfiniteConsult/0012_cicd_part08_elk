@@ -334,4 +334,18 @@ sudo chown "$CURRENT_USER":"$CURRENT_GROUP" "$ELK_BASE"/filebeat/filebeat.env
 
 chmod 600 "$ELK_BASE"/*/*.env
 
+# --- 9. Final Configuration Permissions (CRITICAL FIX) ---
+echo "Enforcing strict permissions on configuration files..."
+
+# Filebeat requires root ownership and no write access for others
+sudo chown root:root "$FILEBEAT_CONFIG_DIR/filebeat.yml"
+sudo chmod 644 "$FILEBEAT_CONFIG_DIR/filebeat.yml"
+
+# Elasticsearch and Kibana run as UID 1000, but files should be readable
+sudo chown 1000:0 "$ES_CONFIG_DIR/elasticsearch.yml"
+sudo chmod 644 "$ES_CONFIG_DIR/elasticsearch.yml"
+
+sudo chown 1000:0 "$KIBANA_CONFIG_DIR/kibana.yml"
+sudo chmod 644 "$KIBANA_CONFIG_DIR/kibana.yml"
+
 echo "✅ Setup Complete."
