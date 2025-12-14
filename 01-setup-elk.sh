@@ -6,11 +6,11 @@
 #
 #  The "Architect" script for the ELK Stack.
 #
-#  1. Kernel: Enforces vm.max_map_count=262144 (Idempotent).
+#  1. Kernel: Enforces vm.max_map_count=262144.
 #  2. Secrets: Generates Passwords & Encryption Keys.
-#  3. Certs: Stages keys using sudo; sets container ownership (1000:0).
-#  4. Configs: Generates elasticsearch.yml, kibana.yml, filebeat.yml.
-#  5. Permissions: Fixes ownership of env files for the host user.
+#  3. Preparation: Temporarily owns config dirs for writing.
+#  4. Configs: Generates configs with properly expanded variables.
+#  5. Permissions: Enforces strict ownership (Root/UID 1000) at the end.
 #
 # -----------------------------------------------------------
 
@@ -25,7 +25,6 @@ MASTER_ENV_FILE="$HOST_CICD_ROOT/cicd.env"
 CA_DIR="$HOST_CICD_ROOT/ca"
 SRC_CA_CRT="$CA_DIR/pki/certs/ca.pem"
 
-# Distinct Service Certificates
 SRC_ES_CRT="$CA_DIR/pki/services/elk/elasticsearch.cicd.local/elasticsearch.cicd.local.crt.pem"
 SRC_ES_KEY="$CA_DIR/pki/services/elk/elasticsearch.cicd.local/elasticsearch.cicd.local.key.pem"
 
@@ -39,46 +38,35 @@ FILEBEAT_CONFIG_DIR="$ELK_BASE/filebeat/config"
 
 echo "🚀 Starting ELK 'Architect' Setup..."
 
-# --- 2. Host Kernel Tuning (Idempotent) ---
+# --- 2. Host Kernel Tuning ---
 echo "--- Phase 1: Kernel Tuning ---"
 REQUIRED_MAP_COUNT=262144
 SYSCTL_CONF="/etc/sysctl.conf"
 
-# A. Runtime Check (Fixed sudo)
 CURRENT_MAP_COUNT=$(sudo sysctl -n vm.max_map_count)
-
 if [ "$CURRENT_MAP_COUNT" -lt "$REQUIRED_MAP_COUNT" ]; then
-    echo "Runtime limit too low ($CURRENT_MAP_COUNT). Updating immediately..."
+    echo "Updating runtime limit..."
     sudo sysctl -w vm.max_map_count=$REQUIRED_MAP_COUNT
 else
-    echo "Runtime limit is sufficient ($CURRENT_MAP_COUNT)."
+    echo "Runtime limit sufficient."
 fi
 
-# B. Persistence Check
-echo "    Checking persistence in $SYSCTL_CONF..."
-
-if grep -q "^\s*vm.max_map_count" "$SYSCTL_CONF"; then
-    STORED_VAL=$(grep "^\s*vm.max_map_count" "$SYSCTL_CONF" | awk -F= '{print $2}' | tr -d '[:space:]')
-    if [[ "$STORED_VAL" -lt "$REQUIRED_MAP_COUNT" ]]; then
-        echo "Stored value ($STORED_VAL) is too low. Updating config in-place..."
-        sudo sed -i "s/^\s*vm.max_map_count.*/vm.max_map_count=$REQUIRED_MAP_COUNT/" "$SYSCTL_CONF"
-    else
-        echo "Stored configuration is sufficient ($STORED_VAL)."
-    fi
-else
-    echo "Value missing. Appending to config..."
+if ! grep -q "vm.max_map_count=$REQUIRED_MAP_COUNT" "$SYSCTL_CONF"; then
+    echo "Persisting limit in $SYSCTL_CONF..."
+    # Remove old entry if exists (simplistic approach) or append
+    sudo sed -i '/vm.max_map_count/d' "$SYSCTL_CONF"
     echo "vm.max_map_count=$REQUIRED_MAP_COUNT" | sudo tee -a "$SYSCTL_CONF" > /dev/null
 fi
 
-# --- 3. Directory Setup ---
-echo "--- Phase 2: Directory Scaffolding ---"
+# --- 3. Directory & Secrets Setup ---
+echo "--- Phase 2: Secrets & Directories ---"
+
+# Create scaffolding
 sudo mkdir -p "$ES_CONFIG_DIR/certs"
 sudo mkdir -p "$KIBANA_CONFIG_DIR/certs"
 sudo mkdir -p "$FILEBEAT_CONFIG_DIR/certs"
 
-# --- 4. Secrets Management ---
-echo "--- Phase 3: Secrets Generation ---"
-
+# Secrets Generation
 if [ ! -f "$MASTER_ENV_FILE" ]; then touch "$MASTER_ENV_FILE"; fi
 
 key_exists() { grep -q "^$1=" "$MASTER_ENV_FILE"; }
@@ -87,79 +75,54 @@ generate_password() { openssl rand -hex 16; }
 
 update_env=false
 
-# 4a. User Passwords
 if ! key_exists "ELASTIC_PASSWORD"; then
-    echo "Generating ELASTIC_PASSWORD..."
     echo "ELASTIC_PASSWORD=\"$(generate_password)\"" >> "$MASTER_ENV_FILE"
     update_env=true
 fi
 if ! key_exists "KIBANA_PASSWORD"; then
-    echo "Generating KIBANA_PASSWORD..."
     echo "KIBANA_PASSWORD=\"$(generate_password)\"" >> "$MASTER_ENV_FILE"
     update_env=true
 fi
-
-# 4b. Kibana Encryption Keys
 if ! key_exists "XPACK_SECURITY_ENCRYPTIONKEY"; then
-    echo "Generating Persistence Keys..."
     echo "XPACK_SECURITY_ENCRYPTIONKEY=\"$(generate_secret)\"" >> "$MASTER_ENV_FILE"
     echo "XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY=\"$(generate_secret)\"" >> "$MASTER_ENV_FILE"
     echo "XPACK_REPORTING_ENCRYPTIONKEY=\"$(generate_secret)\"" >> "$MASTER_ENV_FILE"
     update_env=true
 fi
 
-if [ "$update_env" = true ]; then echo "Secrets updated in cicd.env"; else echo "Secrets already exist."; fi
+if [ "$update_env" = true ]; then echo "Secrets generated."; else echo "Secrets loaded."; fi
 
 set -a; source "$MASTER_ENV_FILE"; set +a
 
-# --- 5. Certificate Staging ---
+# --- 4. Ownership Handoff (The Fix) ---
+echo "--- Phase 3: Ownership Handoff ---"
+# We recursively change ownership to the current user so we can write configs/certs
+# without sudo. This ensures environment variables are preserved during writing.
+CURRENT_USER=$(id -u)
+CURRENT_GROUP=$(id -g)
+sudo chown -R "$CURRENT_USER:$CURRENT_GROUP" "$ELK_BASE"
+
+# --- 5. Staging Certificates ---
 echo "--- Phase 4: Staging Certificates ---"
+# Now we can just use cp because we own the destination
+cp "$SRC_ES_CRT" "$ES_CONFIG_DIR/certs/elasticsearch.crt"
+cp "$SRC_ES_KEY" "$ES_CONFIG_DIR/certs/elasticsearch.key"
+cp "$SRC_CA_CRT" "$ES_CONFIG_DIR/certs/ca.pem"
 
-# Validate existence
-if [ ! -f "$SRC_ES_CRT" ] || [ ! -f "$SRC_ES_KEY" ]; then
-    echo "ERROR: Elasticsearch certificates not found."
-    exit 1
-fi
-if [ ! -f "$SRC_KIB_CRT" ] || [ ! -f "$SRC_KIB_KEY" ]; then
-    echo "ERROR: Kibana certificates not found."
-    exit 1
-fi
+cp "$SRC_KIB_CRT" "$KIBANA_CONFIG_DIR/certs/kibana.crt"
+cp "$SRC_KIB_KEY" "$KIBANA_CONFIG_DIR/certs/kibana.key"
+cp "$SRC_CA_CRT"  "$KIBANA_CONFIG_DIR/certs/ca.pem"
 
-# Use sudo cp to overwrite potential root-owned files
-echo "Staging Elasticsearch certificates..."
-sudo cp "$SRC_ES_CRT" "$ES_CONFIG_DIR/certs/elasticsearch.crt"
-sudo cp "$SRC_ES_KEY" "$ES_CONFIG_DIR/certs/elasticsearch.key"
-sudo cp "$SRC_CA_CRT" "$ES_CONFIG_DIR/certs/ca.pem"
-
-echo "Staging Kibana certificates..."
-sudo cp "$SRC_KIB_CRT" "$KIBANA_CONFIG_DIR/certs/kibana.crt"
-sudo cp "$SRC_KIB_KEY" "$KIBANA_CONFIG_DIR/certs/kibana.key"
-sudo cp "$SRC_CA_CRT"  "$KIBANA_CONFIG_DIR/certs/ca.pem"
-
-echo "Staging Filebeat CA..."
-sudo cp "$SRC_CA_CRT"  "$FILEBEAT_CONFIG_DIR/certs/ca.pem"
-
-# D. Permissions
-echo "Fixing permissions..."
-# ES and Kibana run as UID 1000. We give group ownership to root (0).
-sudo chown -R 1000:0 "$ES_CONFIG_DIR/certs"
-sudo chown -R 1000:0 "$KIBANA_CONFIG_DIR/certs"
-# Filebeat runs as root
-sudo chown -R 0:0    "$FILEBEAT_CONFIG_DIR/certs"
-
-# Secure Keys (600), Public Certs (644)
-sudo chmod 600 "$ES_CONFIG_DIR/certs/"*.key
-sudo chmod 600 "$KIBANA_CONFIG_DIR/certs/"*.key
-sudo chmod 644 "$ES_CONFIG_DIR/certs/"*.crt
-sudo chmod 644 "$KIBANA_CONFIG_DIR/certs/"*.crt
+cp "$SRC_CA_CRT"  "$FILEBEAT_CONFIG_DIR/certs/ca.pem"
 
 # --- 6. Configuration Generation ---
 echo "--- Phase 5: Generating Config Files ---"
 
-# A. Elasticsearch Configuration
-sudo bash -c "cat << EOF > \"$ES_CONFIG_DIR/elasticsearch.yml\"
-cluster.name: \"cicd-elk\"
-node.name: \"elasticsearch.cicd.local\"
+# A. Elasticsearch
+# No variables needed here, but writing as user is safer
+cat << EOF > "$ES_CONFIG_DIR/elasticsearch.yml"
+cluster.name: "cicd-elk"
+node.name: "elasticsearch.cicd.local"
 network.host: 0.0.0.0
 discovery.type: single-node
 
@@ -172,37 +135,39 @@ xpack.security.http.ssl:
   enabled: true
   key: /usr/share/elasticsearch/config/certs/elasticsearch.key
   certificate: /usr/share/elasticsearch/config/certs/elasticsearch.crt
-  certificate_authorities: [ \"/usr/share/elasticsearch/config/certs/ca.pem\" ]
+  certificate_authorities: [ "/usr/share/elasticsearch/config/certs/ca.pem" ]
 
 xpack.security.transport.ssl:
   enabled: true
   key: /usr/share/elasticsearch/config/certs/elasticsearch.key
   certificate: /usr/share/elasticsearch/config/certs/elasticsearch.crt
-  certificate_authorities: [ \"/usr/share/elasticsearch/config/certs/ca.pem\" ]
+  certificate_authorities: [ "/usr/share/elasticsearch/config/certs/ca.pem" ]
 
 ingest.geoip.downloader.enabled: false
-EOF"
+EOF
 
-# B. Kibana Configuration
-# We use \${VAR} to tell Docker to replace this at runtime from the env file
-sudo bash -c "cat << EOF > \"$KIBANA_CONFIG_DIR/kibana.yml\"
-server.host: \"0.0.0.0\"
-server.name: \"kibana.cicd.local\"
-server.publicBaseUrl: \"https://kibana.cicd.local:5601\"
+# B. Kibana
+# Note: We escape \${VAR} for Docker runtime variables.
+# We use $VAR (no escape) for values we want to hardcode NOW (from this script).
+cat << EOF > "$KIBANA_CONFIG_DIR/kibana.yml"
+server.host: "0.0.0.0"
+server.name: "kibana.cicd.local"
+server.publicBaseUrl: "https://kibana.cicd.local:5601"
 
 server.ssl.enabled: true
-server.ssl.certificate: \"/usr/share/kibana/config/certs/kibana.crt\"
-server.ssl.key: \"/usr/share/kibana/config/certs/kibana.key\"
-server.ssl.certificateAuthorities: [\"/usr/share/kibana/config/certs/ca.pem\"]
+server.ssl.certificate: "/usr/share/kibana/config/certs/kibana.crt"
+server.ssl.key: "/usr/share/kibana/config/certs/kibana.key"
+server.ssl.certificateAuthorities: ["/usr/share/kibana/config/certs/ca.pem"]
 
-elasticsearch.hosts: [ \"https://elasticsearch.cicd.local:9200\" ]
-elasticsearch.ssl.certificateAuthorities: [ \"/usr/share/kibana/config/certs/ca.pem\" ]
-elasticsearch.username: \"kibana_system\"
-elasticsearch.password: \"\${ELASTICSEARCH_PASSWORD}\"
+elasticsearch.hosts: [ "https://elasticsearch.cicd.local:9200" ]
+elasticsearch.ssl.certificateAuthorities: [ "/usr/share/kibana/config/certs/ca.pem" ]
+elasticsearch.username: "kibana_system"
+elasticsearch.password: "\${ELASTICSEARCH_PASSWORD}"
 
-xpack.security.encryptionKey: \"\${XPACK_SECURITY_ENCRYPTIONKEY}\"
-xpack.encryptedSavedObjects.encryptionKey: \"\${XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY}\"
-xpack.reporting.encryptionKey: \"\${XPACK_REPORTING_ENCRYPTIONKEY}\"
+# These are hardcoded from the secrets file immediately
+xpack.security.encryptionKey: "$XPACK_SECURITY_ENCRYPTIONKEY"
+xpack.encryptedSavedObjects.encryptionKey: "$XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY"
+xpack.reporting.encryptionKey: "$XPACK_REPORTING_ENCRYPTIONKEY"
 
 telemetry.enabled: false
 telemetry.optIn: false
@@ -213,24 +178,25 @@ xpack.apm.enabled: false
 
 xpack.actions.preconfigured:
   mattermost-webhook:
-    name: \"Mattermost CI/CD Channel\"
+    name: "Mattermost CI/CD Channel"
     actionTypeId: .webhook
     config:
-      # Maps to the env var we inject in kibana.env
-      url: \"\${MATTERMOST_WEBHOOK_URL}\"
+      url: "\${MATTERMOST_WEBHOOK_URL}"
       method: post
       hasAuth: false
-EOF"
+EOF
 
-# C. Filebeat Configuration
-sudo bash -c "cat << EOF > \"$FILEBEAT_CONFIG_DIR/filebeat.yml\"
+# C. Filebeat
+# CRITICAL FIX: We use $ELASTIC_PASSWORD (unescaped).
+# This injects the ACTUAL password string into the file, bypassing Docker variable expansion issues.
+cat << EOF > "$FILEBEAT_CONFIG_DIR/filebeat.yml"
 filebeat.inputs:
   # 1. Jenkins
   - type: filestream
     id: jenkins-logs
     paths:
       - /host_volumes/jenkins-home/_data/logs/jenkins.log
-    fields: { service_name: \"jenkins\" }
+    fields: { service_name: "jenkins" }
     fields_under_root: true
     multiline.type: pattern
     multiline.pattern: '^\d{4}-\d{2}-\d{2}'
@@ -243,7 +209,7 @@ filebeat.inputs:
     paths:
       - /host_volumes/gitlab-logs/_data/nginx/*access.log
       - /host_volumes/gitlab-logs/_data/nginx/*error.log
-    fields: { service_name: \"gitlab-nginx\" }
+    fields: { service_name: "gitlab-nginx" }
     fields_under_root: true
 
   # 3. SonarQube CE
@@ -251,7 +217,7 @@ filebeat.inputs:
     id: sonarqube-ce
     paths:
       - /host_volumes/sonarqube-logs/_data/ce.log
-    fields: { service_name: \"sonarqube\" }
+    fields: { service_name: "sonarqube" }
     fields_under_root: true
     multiline.type: pattern
     multiline.pattern: '^\d{4}.\d{2}.\d{2}'
@@ -263,7 +229,7 @@ filebeat.inputs:
     id: mattermost
     paths:
       - /host_volumes/mattermost-logs/_data/mattermost.log
-    fields: { service_name: \"mattermost\" }
+    fields: { service_name: "mattermost" }
     fields_under_root: true
 
   # 5. Artifactory
@@ -273,7 +239,7 @@ filebeat.inputs:
       - /host_volumes/artifactory-data/_data/log/artifactory-service.log
       - /host_volumes/artifactory-data/_data/log/artifactory-request.log
       - /host_volumes/artifactory-data/_data/log/access-service.log
-    fields: { service_name: \"artifactory\" }
+    fields: { service_name: "artifactory" }
     fields_under_root: true
     multiline.type: pattern
     multiline.pattern: '^\d{4}-\d{2}-\d{2}'
@@ -286,66 +252,70 @@ filebeat.inputs:
     paths:
       - /host_system_logs/syslog
       - /host_system_logs/auth.log
-    fields: { service_name: \"system\" }
+    fields: { service_name: "system" }
     fields_under_root: true
 
 output.elasticsearch:
-  hosts: [\"https://elasticsearch.cicd.local:9200\"]
-  pipeline: \"cicd-logs\"
-  protocol: \"https\"
-  ssl.certificate_authorities: [\"/usr/share/filebeat/certs/ca.pem\"]
-  username: \"elastic\"
-  password: \"\${ELASTIC_PASSWORD}\"
+  hosts: ["https://elasticsearch.cicd.local:9200"]
+  pipeline: "cicd-logs"
+  protocol: "https"
+  ssl.certificate_authorities: ["/usr/share/filebeat/certs/ca.pem"]
+  username: "elastic"
+  password: "$ELASTIC_PASSWORD"
 
 setup.ilm.enabled: false
 setup.template.enabled: false
-EOF"
+EOF
 
-# --- 7. Generate Scoped Environment Files ---
-echo "--- Phase 6: Generating Scoped Env Files ---"
-
-# We use sudo tee to write, which creates root-owned files
-cat << EOF | sudo tee "$ELK_BASE/elasticsearch/elasticsearch.env" > /dev/null
+# --- 7. Env Files ---
+echo "--- Phase 6: Scoped Env Files ---"
+# Writing these as user is fine, we fix permissions later.
+cat << EOF > "$ELK_BASE/elasticsearch/elasticsearch.env"
 ELASTIC_PASSWORD=$ELASTIC_PASSWORD
 ES_JAVA_OPTS=-Xms1g -Xmx1g
 EOF
 
-cat << EOF | sudo tee "$ELK_BASE/kibana/kibana.env" > /dev/null
+cat << EOF > "$ELK_BASE/kibana/kibana.env"
 ELASTICSEARCH_PASSWORD=$KIBANA_PASSWORD
 XPACK_SECURITY_ENCRYPTIONKEY=$XPACK_SECURITY_ENCRYPTIONKEY
 XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY=$XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY
 XPACK_REPORTING_ENCRYPTIONKEY=$XPACK_REPORTING_ENCRYPTIONKEY
-# NEW: Inject the webhook URL from master secrets
 MATTERMOST_WEBHOOK_URL=$SONAR_MATTERMOST_WEBHOOK
 EOF
 
-cat << EOF | sudo tee "$ELK_BASE/filebeat/filebeat.env" > /dev/null
+cat << EOF > "$ELK_BASE/filebeat/filebeat.env"
 ELASTIC_PASSWORD=$ELASTIC_PASSWORD
 EOF
 
-# --- 8. Permission Fix for Env Files ---
-echo "Fixing ownership of environment files for current user..."
-CURRENT_USER=$(id -u)
-CURRENT_GROUP=$(id -g)
+# --- 8. Final Permissions Lockdown (CRITICAL) ---
+echo "--- Phase 7: Locking Down Permissions ---"
 
-sudo chown "$CURRENT_USER":"$CURRENT_GROUP" "$ELK_BASE"/elasticsearch/elasticsearch.env
-sudo chown "$CURRENT_USER":"$CURRENT_GROUP" "$ELK_BASE"/kibana/kibana.env
-sudo chown "$CURRENT_USER":"$CURRENT_GROUP" "$ELK_BASE"/filebeat/filebeat.env
+# Secure the Keys (600) and Certs (644)
+chmod 600 "$ES_CONFIG_DIR/certs/"*.key
+chmod 600 "$KIBANA_CONFIG_DIR/certs/"*.key
+chmod 644 "$ES_CONFIG_DIR/certs/"*.crt
+chmod 644 "$KIBANA_CONFIG_DIR/certs/"*.crt
+chmod 644 "$FILEBEAT_CONFIG_DIR/certs/"*.pem
 
+# Secure Env Files (600 - Owner Only)
 chmod 600 "$ELK_BASE"/*/*.env
 
-# --- 9. Final Configuration Permissions (CRITICAL FIX) ---
-echo "Enforcing strict permissions on configuration files..."
+# Apply Ownership
+# Elasticsearch & Kibana (UID 1000)
+sudo chown -R 1000:0 "$ES_CONFIG_DIR"
+sudo chown -R 1000:0 "$KIBANA_CONFIG_DIR"
+sudo chown 1000:0 "$ELK_BASE/elasticsearch/elasticsearch.env"
+sudo chown 1000:0 "$ELK_BASE/kibana/kibana.env"
 
-# Filebeat requires root ownership and no write access for others
-sudo chown root:root "$FILEBEAT_CONFIG_DIR/filebeat.yml"
+# Filebeat (Root) - REQUIRED for startup
+sudo chown -R root:root "$FILEBEAT_CONFIG_DIR"
+sudo chown root:root "$ELK_BASE/filebeat/filebeat.env"
+
+# Enforce Filebeat Config Perms (Must be 0644 or 0600)
 sudo chmod 644 "$FILEBEAT_CONFIG_DIR/filebeat.yml"
+# Allow Env files to be readable by the specific containers
+sudo chmod 644 "$ELK_BASE/elasticsearch/elasticsearch.env"
+sudo chmod 644 "$ELK_BASE/kibana/kibana.env"
+sudo chmod 644 "$ELK_BASE/filebeat/filebeat.env"
 
-# Elasticsearch and Kibana run as UID 1000, but files should be readable
-sudo chown 1000:0 "$ES_CONFIG_DIR/elasticsearch.yml"
-sudo chmod 644 "$ES_CONFIG_DIR/elasticsearch.yml"
-
-sudo chown 1000:0 "$KIBANA_CONFIG_DIR/kibana.yml"
-sudo chmod 644 "$KIBANA_CONFIG_DIR/kibana.yml"
-
-echo "✅ Setup Complete."
+echo "✅ Architect Setup Complete."
