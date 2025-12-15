@@ -2,10 +2,10 @@
 
 #
 # -----------------------------------------------------------
-#           04-setup-pipelines.sh (Final Fix)
+#           04-setup-pipelines.sh
 #
 #  Configures Elasticsearch Ingest Pipelines.
-#  Refined based on actual log samples.
+#  Defines parsing logic for all CICD stack components.
 # -----------------------------------------------------------
 
 set -e
@@ -28,6 +28,17 @@ PIPELINE_JSON=$(cat <<'EOF'
         "field": "event.original",
         "value": "{{message}}",
         "ignore_empty_value": true
+      }
+    },
+    {
+      "grok": {
+        "field": "message",
+        "patterns": [
+          "\\[%{TIMESTAMP_ISO8601:timestamp}\\] \\[%{LOGLEVEL:log.level}\\] %{DATA:logger_name} - %{GREEDYDATA:message}"
+        ],
+        "if": "ctx.service_name == 'jenkins'",
+        "ignore_missing": true,
+        "ignore_failure": true
       }
     },
     {
@@ -131,13 +142,11 @@ EOF
 # --- 3. Upload to Elasticsearch ---
 echo "--- Uploading 'cicd-logs' Pipeline ---"
 
-# We use -w to capture the HTTP status code at the end
 RESPONSE=$(curl -s -k -w "\n%{http_code}" -X PUT "https://127.0.0.1:9200/_ingest/pipeline/cicd-logs" \
   -u "elastic:$ELASTIC_PASSWORD" \
   -H "Content-Type: application/json" \
   -d "$PIPELINE_JSON")
 
-# Extract Body and Status Code
 HTTP_BODY=$(echo "$RESPONSE" | sed '$d')
 HTTP_STATUS=$(echo "$RESPONSE" | tail -n1)
 
