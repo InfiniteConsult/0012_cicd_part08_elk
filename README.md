@@ -517,3 +517,201 @@ In **Phase 7**, we enforce strict file permissions. This is critical because som
 * **Filebeat Configs:** Owned by `root:root`. **This is mandatory.** Filebeat requires its configuration file to be owned by root and not writable by others (`chmod 644`). If you miss this, Filebeat will fail to start with a "config file permission error."
 
 With the Architect script complete, the foundation is laid. The kernel is tuned, secrets are generated, configs are written, and permissions are locked. We are ready to deploy the database.
+
+# Chapter 3: The Bedrock – Elasticsearch
+
+## 3.1 The Deployment Script
+
+With the "Architect" script complete, the kernel is tuned and the secrets are safely stored. We are now ready to lay the foundation of our observability stack: the Elasticsearch database.
+
+This is not a generic "Hello World" deployment. This script is designed to handle the specific startup requirements of a production-grade search engine, including memory locking, file descriptor management, and an automated security bootstrap process.
+
+Create `02-deploy-elasticsearch.sh` with the following content:
+
+```bash
+#!/usr/bin/env bash
+
+#
+# -----------------------------------------------------------
+#               02-deploy-elasticsearch.sh
+#
+#  The "Bedrock" script.
+#  Deploys Elasticsearch (v9.2.2) and bootstraps security.
+#
+#  1. Deploy: Runs ES with strict memory/ulimit guards.
+#  2. Healthcheck: Waits for Green status via HTTPS (using CA).
+#  3. Bootstrap: Sets 'kibana_system' password via API.
+#
+# -----------------------------------------------------------
+
+set -e
+echo "🚀 Deploying Elasticsearch (The Bedrock)..."
+
+# --- 1. Load Secrets ---
+HOST_CICD_ROOT="$HOME/cicd_stack"
+ELK_BASE="$HOST_CICD_ROOT/elk"
+SCOPED_ENV_FILE="$ELK_BASE/elasticsearch/elasticsearch.env"
+MASTER_ENV_FILE="$HOST_CICD_ROOT/cicd.env"
+
+if [ ! -f "$SCOPED_ENV_FILE" ]; then
+    echo "ERROR: Scoped env file not found at $SCOPED_ENV_FILE"
+    echo "Please run 01-setup-elk.sh first."
+    exit 1
+fi
+
+# We need KIBANA_PASSWORD from master env for the bootstrap step
+if [ ! -f "$MASTER_ENV_FILE" ]; then
+    echo "ERROR: Master env file not found."
+    exit 1
+fi
+set -a; source "$MASTER_ENV_FILE"; set +a
+
+if [ -z "$KIBANA_PASSWORD" ]; then
+    echo "ERROR: KIBANA_PASSWORD not found in cicd.env"
+    exit 1
+fi
+
+# --- 2. Clean Slate ---
+if [ "$(docker ps -q -f name=elasticsearch)" ]; then
+    echo "Stopping existing 'elasticsearch'..."
+    docker stop elasticsearch
+fi
+if [ "$(docker ps -aq -f name=elasticsearch)" ]; then
+    echo "Removing existing 'elasticsearch'..."
+    docker rm elasticsearch
+fi
+
+# --- 3. Volume Management ---
+echo "Verifying elasticsearch-data volume..."
+docker volume create elasticsearch-data > /dev/null
+
+# --- 4. Deploy ---
+echo "--- Launching Container ---"
+
+# NOTES:
+# - ulimit: Essential for ES performance (avoids bootstrap checks failure)
+# - cap-add IPC_LOCK: Allows memory locking to prevent swapping
+# - publish: 9200 bound to 127.0.0.1 (Host access only)
+
+docker run -d \
+  --name elasticsearch \
+  --restart always \
+  --network cicd-net \
+  --hostname elasticsearch.cicd.local \
+  --publish 127.0.0.1:9200:9200 \
+  --ulimit nofile=65535:65535 \
+  --ulimit memlock=-1:-1 \
+  --cap-add=IPC_LOCK \
+  --env-file "$SCOPED_ENV_FILE" \
+  --volume elasticsearch-data:/usr/share/elasticsearch/data \
+  --volume "$ELK_BASE/elasticsearch/config/elasticsearch.yml":/usr/share/elasticsearch/config/elasticsearch.yml \
+  --volume "$ELK_BASE/elasticsearch/config/certs":/usr/share/elasticsearch/config/certs \
+  docker.elastic.co/elasticsearch/elasticsearch:9.2.2
+
+echo "Container started. Waiting for healthcheck..."
+
+# --- 5. Secure Bootstrap (The "Zero Touch" Logic) ---
+
+MAX_RETRIES=60
+COUNT=0
+ES_URL="https://127.0.0.1:9200"
+
+# A. Extract ELASTIC_PASSWORD securely (Avoiding 'source' errors)
+ELASTIC_PASSWORD=$(grep "^ELASTIC_PASSWORD=" "$SCOPED_ENV_FILE" | cut -d'=' -f2 | tr -d '"')
+
+# Wait for "status" to be green OR yellow
+# We removed --cacert because the host trusts the CA
+until curl -s -u "elastic:$ELASTIC_PASSWORD" "$ES_URL/_cluster/health" | grep -qE '"status":"(green|yellow)"'; do
+    if [ $COUNT -ge $MAX_RETRIES ]; then
+        echo "❌ Timeout waiting for Elasticsearch."
+        echo "Check logs: docker logs elasticsearch"
+        exit 1
+    fi
+    echo "   [$COUNT/$MAX_RETRIES] Waiting for Green/Yellow status..."
+    sleep 5
+    COUNT=$((COUNT+1))
+done
+
+echo "✅ Elasticsearch is Online."
+
+# B. Set kibana_system Password
+echo "--- Bootstrapping Service Accounts ---"
+
+# 1. Run the command and let it print directly to stdout
+curl -i \
+    -X POST "$ES_URL/_security/user/kibana_system/_password" \
+    -u "elastic:$ELASTIC_PASSWORD" \
+    -H "Content-Type: application/json" \
+    -d "{\"password\":\"$KIBANA_PASSWORD\"}"
+
+# 2. Check the exit status of the curl command itself (simplified check)
+if [ $? -eq 0 ]; then
+    echo "" # Newline for formatting
+    echo "✅ 'kibana_system' password request sent."
+else
+    echo ""
+    echo "❌ Failed to send password request."
+    exit 1
+fi
+
+echo "--- Bedrock Deployed Successfully ---"
+```
+
+## 3.2 Performance Tuning & System Limits
+
+In the deployment script above, you will notice a set of aggressive flags passed to the `docker run` command. These are not optional; they are the difference between a database that runs for months and one that crashes under load.
+
+**1. Memory Locking (`bootstrap.memory_lock`)**
+We pass `--cap-add=IPC_LOCK` and `--ulimit memlock=-1:-1` to the container.
+
+Elasticsearch is a Java application. If the host operating system decides to "swap" part of the Java Heap to the hard disk to save RAM, performance falls off a cliff. Even worse, the garbage collector can pause for seconds (or minutes) trying to read memory back from the disk. By granting `IPC_LOCK` capability, we allow Elasticsearch to "lock" its allocated memory in RAM, preventing the OS from ever swapping it out.
+
+**2. File Descriptors (`ulimit nofile`)**
+We set `--ulimit nofile=65535:65535`.
+
+Under the hood, Elasticsearch uses the Lucene search library. Lucene creates thousands of tiny files to manage its indices. A standard Linux process is often limited to 1,024 open files. If we don't raise this limit, Elasticsearch will hit a "wall" during heavy indexing and crash with a `Too many open files` exception. We preemptively raise this to 65k.
+
+## 3.3 Network Security: The Localhost Bind
+
+You might notice the port mapping looks different from previous articles:
+`--publish 127.0.0.1:9200:9200`
+
+In previous scripts, we mapped ports to `0.0.0.0` (all interfaces) or relied on the Docker bridge network. Here, we are explicitly binding port 9200 to `127.0.0.1` (localhost) only.
+
+This is a **Defense in Depth** strategy.
+
+Elasticsearch is the "Brain" of our stack. It holds all our logs, which may contain sensitive data. By binding strictly to localhost, we ensure that **no external device** on the network can talk directly to the database, even if our firewall rules fail.
+
+* **Who can talk to it?**
+    * **Kibana:** Yes, because it joins the same Docker network (`cicd-net`).
+    * **Filebeat:** Yes, via the Docker network.
+    * **You (The Admin):** Yes, via `curl` on the host machine.
+* **Who cannot talk to it?**
+    * Another developer's laptop.
+    * A rogue device on the Wi-Fi.
+
+This forces all human access to go through the visualized, authenticated layer (Kibana) rather than the raw data API.
+
+## 3.4 The "Bootstrap" Dance (Automating Service Accounts)
+
+The most complex part of this script is **Section 5: Secure Bootstrap**.
+
+We have a "Chicken and Egg" problem.
+
+1.  Kibana needs a password to log in to Elasticsearch (`kibana_system` user).
+2.  Elasticsearch does not allow us to set this password via an environment variable at startup.
+3.  We can only set this password via the REST API *after* Elasticsearch is running.
+
+Most tutorials solve this by telling you to "run the container, wait a minute, and then manually run this curl command." That is not automation; that is manual labor.
+
+Our script solves this with a **Healthcheck Loop**.
+It uses `curl` to poll the cluster status (`_cluster/health`). It loops every 5 seconds until it gets a HTTP 200 OK and a status of "Green" or "Yellow."
+
+Only when the brain is fully awake does the script execute the **API Injection**:
+
+```bash
+curl -X POST "$ES_URL/_security/user/kibana_system/_password" ...
+```
+
+This automatically sets the password we generated in the Architect script. The result is a "Zero Touch" deployment: you run the script, walk away, and come back to a fully secured, interconnected cluster.
+
