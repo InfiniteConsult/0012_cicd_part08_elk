@@ -715,7 +715,11 @@ curl -X POST "$ES_URL/_security/user/kibana_system/_password" ...
 
 This automatically sets the password we generated in the Architect script. The result is a "Zero Touch" deployment: you run the script, walk away, and come back to a fully secured, interconnected cluster.
 
-#Chapter 4: The Interface – Kibana##4.1 The Deployment ScriptWith Elasticsearch running as our data store, we need a way to visualize the information. Kibana is the native interface for the Elastic Stack, providing the dashboards, search bars, and management tools we will use to operate the platform.
+# Chapter 4: The Interface – Kibana 
+
+## 4.1 The Deployment Script
+
+With Elasticsearch running as our data store, we need a way to visualize the information. Kibana is the native interface for the Elastic Stack, providing the dashboards, search bars, and management tools we will use to operate the platform.
 
 While Elasticsearch is the "Backend," Kibana is the "Frontend." It is a Node.js application that queries the database and renders the results. Because it holds the encryption keys for our alerts and saved objects, its deployment requires careful handling of secrets and configuration files.
 
@@ -804,7 +808,9 @@ echo "   Access at: https://kibana.cicd.local:5601"
 
 ```
 
-##4.2 Configuration Strategy (The "Glue")A critical aspect of this deployment is how we manage the connection between Kibana and Elasticsearch without exposing credentials in plain text.
+## 4.2 Configuration Strategy (The "Glue")
+
+A critical aspect of this deployment is how we manage the connection between Kibana and Elasticsearch without exposing credentials in plain text.
 
 In standard Docker tutorials, you might see environment variables passed directly in the `docker run` command (e.g., `-e ELASTICSEARCH_PASSWORD=changeme`). This is insecure because anyone running `docker inspect` can see the password.
 
@@ -825,7 +831,9 @@ We also treat our configuration files as **Immutable**. Notice that `kibana.yml`
 
 This is a security best practice. Even if an attacker were to gain remote code execution within the Kibana Node.js process, they would be unable to overwrite the configuration to disable security or replace the trusted certificates. The container is locked down by the host.
 
-##4.3 The "Startup Race" (Health Checks)One of the most common friction points when automating Kibana deployments is the **Initialization Gap**.
+## 4.3 The "Startup Race" (Health Checks)
+
+One of the most common friction points when automating Kibana deployments is the **Initialization Gap**.
 
 When you execute `docker run`, the Docker daemon returns a success code almost immediately. However, inside the container, Kibana is just waking up. As a heavy Node.js application, it has a lengthy startup sequence:
 
@@ -859,7 +867,9 @@ This is the only state that matters.
 
 By blocking the script until this specific string appears, we guarantee that when the script says "Green and Available," the link we provide will actually load the login page. This transforms the deployment experience from "Run and Pray" to "Run and Verify."
 
-##4.4 Security & AccessFinally, we must address the network exposure of our interface. You will notice the port mapping in our script is explicit:
+## 4.4 Security & Access
+
+Finally, we must address the network exposure of our interface. You will notice the port mapping in our script is explicit:
 
 `--publish 127.0.0.1:5601:5601`
 
@@ -873,3 +883,391 @@ This is a deliberate architectural constraint. In a "Zero Trust" model, we never
 * **For Browsing:** In a real-world production setup, we would place an Nginx Reverse Proxy in front of this container (listening on port 443 with SSL) and route traffic internally to 127.0.0.1:5601. Alternatively, as administrators, we can use an SSH Tunnel (`ssh -L 5601:localhost:5601 user@server`) to securely bridge our laptop to the server.
 
 This restriction ensures that during the vulnerable setup phase—before we have configured complex firewall rules or VPNs—our visualization tool is effectively invisible to the outside world. We are building a "Dark" control center: fully functional, but only accessible to those with the keys to the host.
+
+
+# Chapter 5: The Parsing Engine – Ingest Pipelines
+
+## 5.1 The Pipeline Script
+
+We have a database, and we have a UI. But currently, our logs are just messy strings of text like `[INFO] 2025-12-15 Build Started`. If we send these directly to Elasticsearch, they will be stored as a single blob of text. You won't be able to filter by "Error Level" or "Client IP" because the database doesn't know those fields exist yet.
+
+In the traditional ELK stack, a tool called **Logstash** would sit in the middle to parse this text. However, Logstash is resource-heavy. Since we are optimizing for a lean "Factory in a Box," we will use **Elasticsearch Ingest Pipelines**.
+
+This feature allows us to define a chain of "Processors" inside the database itself. When a log document arrives, Elasticsearch runs it through this chain—extracting fields, fixing timestamps, and removing noise—milliseconds before writing it to disk.
+
+Create `04-setup-pipelines.sh` with the following content. This script defines a single pipeline called `cicd-logs` that acts as a "Universal Adapter" for every service in our stack.
+
+```bash
+#!/usr/bin/env bash
+
+#
+# -----------------------------------------------------------
+#           04-setup-pipelines.sh
+#
+#  Configures Elasticsearch Ingest Pipelines.
+#  Defines parsing logic for all CICD stack components.
+# -----------------------------------------------------------
+
+set -e
+echo "🚀 Configuring Elasticsearch Ingest Pipelines..."
+
+# --- 1. Load Secrets ---
+HOST_CICD_ROOT="$HOME/cicd_stack"
+ELK_BASE="$HOST_CICD_ROOT/elk"
+source "$ELK_BASE/filebeat/filebeat.env"
+
+# --- 2. Define the Pipeline JSON ---
+# CRITICAL: We use 'EOF' (quoted) to prevent Bash from stripping regex backslashes.
+
+PIPELINE_JSON=$(cat <<'EOF'
+{
+  "description": "CICD Stack Log Parsing Pipeline",
+  "processors": [
+    {
+      "set": {
+        "field": "event.original",
+        "value": "{{message}}",
+        "ignore_empty_value": true
+      }
+    },
+    {
+      "grok": {
+        "field": "message",
+        "patterns": [
+          "\\[%{TIMESTAMP_ISO8601:timestamp}\\] \\[%{LOGLEVEL:log.level}\\] %{DATA:logger_name} - %{GREEDYDATA:message}"
+        ],
+        "if": "ctx.service_name == 'jenkins'",
+        "ignore_missing": true,
+        "ignore_failure": true
+      }
+    },
+    {
+      "grok": {
+        "field": "message",
+        "patterns": [
+          "%{IPORHOST:client.ip} - %{DATA:user.name} \\[%{HTTPDATE:timestamp}\\] \"%{WORD:http.request.method} %{DATA:url.path} HTTP/%{NUMBER:http.version}\" %{NUMBER:http.response.status_code:long} %{NUMBER:http.response.body.bytes:long} \"%{DATA:http.request.referrer}\" \"%{DATA:user_agent.original}\""
+        ],
+        "if": "ctx.service_name == 'gitlab-nginx'",
+        "ignore_missing": true,
+        "ignore_failure": true
+      }
+    },
+    {
+      "grok": {
+        "field": "message",
+        "patterns": [
+          "%{YEAR:year}\\.%{MONTHNUM:month}\\.%{MONTHDAY:day} %{TIME:time} %{LOGLEVEL:log.level}\\s+%{GREEDYDATA:message}"
+        ],
+        "if": "ctx.service_name == 'sonarqube'",
+        "ignore_missing": true,
+        "ignore_failure": true
+      }
+    },
+    {
+      "script": {
+        "lang": "painless",
+        "source": "ctx.timestamp = ctx.year + '-' + ctx.month + '-' + ctx.day + 'T' + ctx.time + 'Z'",
+        "if": "ctx.service_name == 'sonarqube' && ctx.year != null"
+      }
+    },
+    {
+      "json": {
+        "field": "message",
+        "target_field": "mattermost",
+        "if": "ctx.service_name == 'mattermost'",
+        "ignore_failure": true
+      }
+    },
+    {
+      "set": {
+        "field": "timestamp",
+        "value": "{{mattermost.timestamp}}",
+        "if": "ctx.service_name == 'mattermost' && ctx.mattermost?.timestamp != null"
+      }
+    },
+    {
+      "set": {
+        "field": "log.level",
+        "value": "{{mattermost.level}}",
+        "if": "ctx.service_name == 'mattermost' && ctx.mattermost?.level != null"
+      }
+    },
+    {
+      "grok": {
+        "field": "message",
+        "patterns": [
+          "%{TIMESTAMP_ISO8601:timestamp} \\[%{DATA:service_type}\\s*\\] \\[%{LOGLEVEL:log.level}\\s*\\] \\[%{DATA:trace_id}\\] \\[%{DATA:class}:%{NUMBER:line}\\] (?>\\[%{DATA:thread_info}\\] )?- %{GREEDYDATA:message}",
+          "%{TIMESTAMP_ISO8601:timestamp}\\|%{DATA:trace_id}\\|%{IP:client.ip}\\|%{DATA:user.name}\\|%{WORD:http.request.method}\\|%{DATA:url.path}\\|%{NUMBER:http.response.status_code:long}\\|.*"
+        ],
+        "if": "ctx.service_name == 'artifactory'",
+        "ignore_missing": true,
+        "ignore_failure": true
+      }
+    },
+    {
+      "date": {
+        "field": "timestamp",
+        "formats": [
+          "ISO8601",
+          "dd/MMM/yyyy:HH:mm:ss Z",
+          "yyyy-MM-dd HH:mm:ss.SSS",
+          "yyyy-MM-dd HH:mm:ss.SSS Z",
+          "yyyy-MM-dd HH:mm:ss Z",
+          "MMM  d HH:mm:ss",
+          "MMM dd HH:mm:ss"
+        ],
+        "target_field": "@timestamp",
+        "ignore_failure": true
+      }
+    },
+    {
+      "remove": {
+        "field": ["timestamp", "year", "month", "day", "time", "mattermost"],
+        "ignore_missing": true
+      }
+    }
+  ],
+  "on_failure": [
+    {
+      "set": {
+        "field": "error.message",
+        "value": "Pipeline failed: {{ _ingest.on_failure_message }}"
+      }
+    }
+  ]
+}
+EOF
+)
+
+# --- 3. Upload to Elasticsearch ---
+echo "--- Uploading 'cicd-logs' Pipeline ---"
+
+RESPONSE=$(curl -s -k -w "\n%{http_code}" -X PUT "https://127.0.0.1:9200/_ingest/pipeline/cicd-logs" \
+  -u "elastic:$ELASTIC_PASSWORD" \
+  -H "Content-Type: application/json" \
+  -d "$PIPELINE_JSON")
+
+HTTP_BODY=$(echo "$RESPONSE" | sed '$d')
+HTTP_STATUS=$(echo "$RESPONSE" | tail -n1)
+
+if [ "$HTTP_STATUS" -eq 200 ]; then
+  echo "✅ Pipeline updated successfully (HTTP 200)."
+  echo "Response: $HTTP_BODY"
+else
+  echo "❌ Error uploading pipeline (HTTP $HTTP_STATUS)."
+  echo "Elasticsearch Response:"
+  echo "$HTTP_BODY"
+  exit 1
+fi
+
+```
+
+## 5.2 The Pipeline Blueprint (JSON Reference)
+
+This JSON object is the "Source Code" for our logging logic. It defines a sequential list of steps that every log entry must pass through. Let's break down the critical components of this file so you can understand exactly how we transform chaos into order.
+
+**1. The Safety Net (`event.original`)**
+The first processor is a `set` operation.
+
+```json
+"set": { "field": "event.original", "value": "{{message}}" }
+
+```
+
+Before we touch anything, we copy the raw log line into a new field called `event.original`. If our complex parsing logic fails or corrupts the data later in the pipeline, we still have the original, untouched text safe and sound.
+
+**2. The Conditional Switch (`if` statements)**
+Notice that almost every processor has an `if` condition attached to it:
+
+```json
+"if": "ctx.service_name == 'jenkins'"
+
+```
+
+This is our routing logic. Filebeat tags every log with a `service_name` (e.g., "jenkins", "gitlab-nginx") before shipping it. The pipeline checks this tag. If the log is from Jenkins, it runs the Jenkins Grok pattern; if it's from Nginx, it skips to the Nginx pattern. This allows us to use a **Single Pipeline** for the entire stack, rather than managing ten small ones.
+
+**3. The Parser (`grok`)**
+Grok is the heavy lifter. It matches the raw text against predefined patterns and extracts structured variables.
+
+* **Pattern:** `%{IPORHOST:client.ip}`
+* **Translation:** "Find a string that looks like an IP address or Hostname. Extract it and save it into the field `client.ip`."
+* **Result:** We can now build a map in Kibana showing where users are logging in from, because `client.ip` is a real data field, not just text.
+
+**4. The Script (`painless`)**
+Sometimes, standard parsers aren't enough. SonarQube logs date and time in two separate fields (`2025.12.15` and `10:00:00`), but Elasticsearch needs a single ISO8601 string.
+We use a tiny script written in **Painless** (Elastic's secure scripting language) to stitch them together:
+
+```java
+ctx.timestamp = ctx.year + '-' + ctx.month + '-' + ctx.day + 'T' + ctx.time + 'Z'
+
+```
+
+This demonstrates the power of Ingest Pipelines: we can execute real programming logic inside the database to clean our data.
+
+**5. The Cleanup (`remove`)**
+Once we have extracted `client.ip`, `http.status`, and `@timestamp`, the intermediate fields (like `year`, `month`, `mattermost` JSON objects) are just wasted disk space. The final step `remove` deletes them, keeping our index lean.
+
+**6. Error Handling (`on_failure`)**
+At the very bottom, we define an `on_failure` block. If a log line is malformed and causes a processor to crash, the pipeline does **not** discard the log. Instead, it catches the exception and adds an `error.message` field. This ensures we never lose data, even if our code has bugs.
+
+## 5.3 Decoding the Services
+
+Now we will walk through the specific parsing logic for each service. This is where we bridge the gap between the application's unique "accent" and the database's strict requirements.
+
+### **1. Jenkins (The Custom Formatter)**
+
+In **Chapter 2**, we forced Jenkins to use a custom Java logging format:
+
+`[%1$tF %1$tT] [%4$s] %3$s - %5$s %6$s%n`
+
+This results in log lines that look like this:
+`[2025-12-15 14:30:00] [INFO] hudson.plugins.git.GitSCM - Fetching changes...`
+
+Our Grok pattern is a direct mirror of this structure:
+
+```json
+"\\[%{TIMESTAMP_ISO8601:timestamp}\\] \\[%{LOGLEVEL:log.level}\\] %{DATA:logger_name} - %{GREEDYDATA:message}"
+
+```
+
+* `\\[ ... \\]`: We escape the brackets because they are special characters in Regex.
+* `%{TIMESTAMP_ISO8601:timestamp}`: Captures the `2025-12-15 14:30:00` part.
+* `%{LOGLEVEL:log.level}`: Captures `INFO`, `WARNING`, or `SEVERE`. By mapping this to `log.level`, Kibana will automatically color-code these rows (Red for Error, Yellow for Warning).
+
+### **2. GitLab Nginx (Standard Web Traffic)**
+
+GitLab's internal Nginx uses the industry-standard "Combined Log Format."
+
+`192.168.1.50 - - [15/Dec/2025:14:30:00 +0000] "GET /api/v4/projects HTTP/1.1" 200 450 ...`
+
+Our Grok pattern extracts the critical metrics for our security dashboard:
+
+```json
+"%{IPORHOST:client.ip} - %{DATA:user.name} \\[%{HTTPDATE:timestamp}\\] ..."
+
+```
+
+* `%{IPORHOST:client.ip}`: This is the most valuable field. It allows us to build the "Intruder Alert" map.
+* `%{NUMBER:http.response.status_code:long}`: We explicitly cast this to a `long` (integer). If we left it as a string, we wouldn't be able to run math aggregations like "Average Response Code" or "Count of 5xx Errors."
+
+### **3. SonarQube (The Format Outlier)**
+
+SonarQube is difficult. It logs date and time separated by a space, using dots for the date:
+
+`2025.12.15 14:30:00 INFO  web[][o.s.s.p.Platform] ...`
+
+A standard Grok pattern can extract `2025.12.15` as `year` and `14:30:00` as `time`, but Elasticsearch requires a single ISO string for time-based indexing.
+
+We solve this with a two-step combo:
+
+1. **Grok:** Extract the parts (`year`, `month`, `day`, `time`).
+2. **Painless Script:**
+```java
+ctx.timestamp = ctx.year + '-' + ctx.month + '-' + ctx.day + 'T' + ctx.time + 'Z'
+
+```
+
+This script manually constructs a valid ISO string (`2025-12-15T14:30:00Z`) which the Date Processor can then understand.
+
+### **4. Mattermost (Structure-Native)**
+
+Mattermost is modern; it logs in JSON format by default.
+
+`{"timestamp": "2025-12-15 14:30:00", "level": "error", "msg": "Database timeout"}`
+
+We don't need Grok (Regex) here. We use the **JSON Processor**:
+
+```json
+"json": { "field": "message", "target_field": "mattermost" }
+
+```
+
+This tells Elasticsearch: "The `message` field contains a JSON string. Parse it and put the resulting object into a new field called `mattermost`."
+We then use `set` processors to promote `mattermost.timestamp` and `mattermost.level` to the top-level `@timestamp` and `log.level` fields, ensuring consistency with Jenkins and Nginx.
+
+### **5. Artifactory (The Polyglot)**
+
+Artifactory is complex because it generates two distinct types of logs in the same stream:
+
+1. **Service Logs:** Java application errors (standard stack traces).
+2. **Request Logs:** Pipe-separated values (`|`) tracking file downloads.
+
+We handle this using a **Grok Array**. We provide multiple patterns to the processor:
+
+```json
+"patterns": [
+  "...Service Log Pattern...",
+  "...Request Log Pattern..."
+]
+
+```
+
+Elasticsearch tries the first pattern. If it fails, it tries the second. This allows a single pipeline to handle both "Application Crashed" (Pattern A) and "User downloaded generic-local/app.jar" (Pattern B) seamlessly.
+
+### **6. The Rosetta Stone: Date Normalization**
+
+Finally, the pipeline ends with the **Date Processor**.
+
+```json
+"formats": [ "ISO8601", "dd/MMM/yyyy:HH:mm:ss Z", "yyyy-MM-dd HH:mm:ss.SSS", ... ]
+
+```
+
+This is the most critical step. Jenkins says `2025-12-15`, Nginx says `15/Dec/2025`. If we simply indexed these as strings, sorting by time would be impossible.
+This processor takes the `timestamp` field we extracted from any of the services above, matches it against *any* of the allowed formats, and converts it to the sacred `@timestamp` field in UTC. This ensures that when you zoom in on "14:30" in Kibana, you see the events from Jenkins, Nginx, and SonarQube perfectly aligned.
+
+
+### **7. A Note on System Logs (The Pass-Through)**
+
+You might notice that our **System Logs** (Journald) are missing from the pipeline's logic. We have defined rules for Jenkins, Nginx, and SonarQube, but there is no `if "ctx.service_name == 'system'"` block.
+
+This is intentional.
+
+Unlike the flat text files generated by Jenkins or Nginx, the Linux Journal (`journald`) is a **structured binary format**. When Filebeat reads from the Journal (via the `journald` input we configured in `filebeat.yml`), it doesn't just read a line of text. It reads a rich object containing the timestamp, the process name, the PID, and the priority level.
+
+Filebeat automatically maps these binary fields to the Elastic Common Schema (ECS) before the data even leaves the host. For example:
+
+* Journal `_COMM` becomes `process.name`.
+* Journal `PRIORITY` becomes `syslog.priority`.
+* Journal `__REALTIME_TIMESTAMP` becomes `@timestamp`.
+
+Because the data arrives at Elasticsearch already parsed and structured, it skips every conditional `if` block in our pipeline. It effectively "falls through" the logic untouched, landing in the index ready to be searched. We don't need to fix what isn't broken.
+
+## 5.4 The Deployment Mechanism
+
+The final part of our script handles the delivery of this logic to the database.
+
+It is important to understand that Ingest Pipelines are **not configuration files**. You cannot simply copy a `.json` file into a folder on the server and expect Elasticsearch to pick it up. Pipelines are part of the **Cluster State**—they live in the memory and disk of the Master Nodes, synchronized across the cluster.
+
+To install a pipeline, we must interact with the Elasticsearch REST API.
+
+```bash
+RESPONSE=$(curl -s -k -w "\n%{http_code}" -X PUT "https://127.0.0.1:9200/_ingest/pipeline/cicd-logs" \
+  -u "elastic:$ELASTIC_PASSWORD" \
+  -H "Content-Type: application/json" \
+  -d "$PIPELINE_JSON")
+
+```
+
+**1. The Method (`PUT`)**
+We use the HTTP `PUT` verb. This is idempotent; if the pipeline already exists, this command overwrites it with the new version. This is perfect for CI/CD: if we update our parsing logic later, we simply re-run this script to apply the changes.
+
+**2. The Endpoint (`_ingest/pipeline/cicd-logs`)**
+We are defining a resource named `cicd-logs`. This name is critical. Later, when we configure Filebeat (Chapter 6), we will tell it specifically to use `pipeline: "cicd-logs"`. If these names do not match, the data will bypass our parser and arrive as raw text.
+
+**3. The Payload (`-d "$PIPELINE_JSON"`)**
+We send the JSON object we defined earlier as the body of the request. Note that we used a Bash Heredoc (`cat <<'EOF'`) to capture that JSON. This ensures that the complex regex backslashes inside the Grok patterns are preserved and not interpreted by the shell.
+
+**4. The Verification**
+The script does not blindly assume success.
+
+```bash
+HTTP_STATUS=$(echo "$RESPONSE" | tail -n1)
+
+if [ "$HTTP_STATUS" -eq 200 ]; then ...
+
+```
+
+If our JSON syntax is invalid—for example, a missing comma or an unescaped quote—Elasticsearch will reject the request with a **400 Bad Request** error and a detailed message explaining *where* the syntax failed. Our script captures this error code and prints the server's response, allowing you to debug the JSON immediately without digging through server logs.
+
+With the pipeline registered, the "Brain" now knows how to read. It is time to deploy the "Collector" to start feeding it data.
