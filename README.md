@@ -1271,3 +1271,203 @@ if [ "$HTTP_STATUS" -eq 200 ]; then ...
 If our JSON syntax is invalid—for example, a missing comma or an unescaped quote—Elasticsearch will reject the request with a **400 Bad Request** error and a detailed message explaining *where* the syntax failed. Our script captures this error code and prints the server's response, allowing you to debug the JSON immediately without digging through server logs.
 
 With the pipeline registered, the "Brain" now knows how to read. It is time to deploy the "Collector" to start feeding it data.
+
+# **Chapter 6: The Collector – Filebeat (`05-deploy-filebeat.sh`)**
+
+This chapter focuses on the "Shipper" that connects our log files to the pipeline we just built.
+
+## 6.1 The Collector Script
+
+We have the database (Elasticsearch), the interface (Kibana), and the parsing logic (Ingest Pipelines). Now we need the agent to physically transport the logs from the hard drive to the cluster.
+
+Create `05-deploy-filebeat.sh` with the following content:
+
+```bash
+#!/usr/bin/env bash
+
+#
+# -----------------------------------------------------------
+#               05-deploy-filebeat.sh
+#
+#  The "Collector" Script.
+#  Deploys Filebeat (v9.2.2) to ship logs to Elasticsearch.
+#
+#  1. Mounts Host Docker Volumes (read app logs).
+#  2. Mounts Host Journal (read system logs).
+#  3. Mounts Data Volume (PERSIST REGISTRY).
+#  4. Runs as ROOT to bypass host directory permissions.
+#
+# -----------------------------------------------------------
+
+set -e
+echo "🚀 Deploying Filebeat (The Collector)..."
+
+# --- 1. Load Paths ---
+HOST_CICD_ROOT="$HOME/cicd_stack"
+ELK_BASE="$HOST_CICD_ROOT/elk"
+SCOPED_ENV_FILE="$ELK_BASE/filebeat/filebeat.env"
+
+if [ ! -f "$SCOPED_ENV_FILE" ]; then
+    echo "ERROR: Scoped env file not found at $SCOPED_ENV_FILE"
+    echo "Please run 01-setup-elk.sh first."
+    exit 1
+fi
+
+# --- 2. Clean Slate ---
+if [ "$(docker ps -q -f name=filebeat)" ]; then
+    echo "Stopping existing 'filebeat'..."
+    docker stop filebeat
+fi
+if [ "$(docker ps -aq -f name=filebeat)" ]; then
+    echo "Removing existing 'filebeat'..."
+    docker rm filebeat
+fi
+
+# --- 3. Volume Management (CRITICAL FIX) ---
+# We must persist the registry so we don't re-ingest old logs on restart.
+echo "Verifying filebeat-data volume..."
+docker volume create filebeat-data > /dev/null
+
+# --- 4. Deploy ---
+echo "--- Launching Container ---"
+
+# NOTES:
+# - user root: Required to traverse /var/lib/docker and read Journal.
+# - /var/log/journal: Required for native journald input.
+# - /etc/machine-id: Required for journald reader to track host identity.
+
+docker run -d \
+  --name filebeat \
+  --restart always \
+  --network cicd-net \
+  --user root \
+  --env-file "$SCOPED_ENV_FILE" \
+  --volume "$ELK_BASE/filebeat/config/filebeat.yml":/usr/share/filebeat/filebeat.yml:ro \
+  --volume "$ELK_BASE/filebeat/config/certs":/usr/share/filebeat/certs:ro \
+  --volume filebeat-data:/usr/share/filebeat/data \
+  --volume /var/lib/docker/volumes:/host_volumes:ro \
+  --volume /var/log/journal:/var/log/journal:ro \
+  --volume /etc/machine-id:/etc/machine-id:ro \
+  docker.elastic.co/beats/filebeat:9.2.2
+
+echo "Container started. Verifying connection..."
+
+# --- 5. Verification ---
+MAX_RETRIES=15
+COUNT=0
+echo "Waiting for Filebeat to establish connection..."
+
+while [ $COUNT -lt $MAX_RETRIES ]; do
+    sleep 2
+    # Check for successful connection message
+    if docker logs filebeat 2>&1 | grep -q "Connection to backoff.*established"; then
+        echo "✅ Filebeat successfully connected to Elasticsearch!"
+        exit 0
+    fi
+
+    # Fail fast on Pipeline errors (common misconfiguration)
+    if docker logs filebeat 2>&1 | grep -q "pipeline/cicd-logs.*missing"; then
+        echo "❌ ERROR: Filebeat says the 'cicd-logs' pipeline is missing!"
+        echo "   Did you run 04-setup-pipelines.sh?"
+        exit 1
+    fi
+
+    # Fail fast on Certificate errors
+    if docker logs filebeat 2>&1 | grep -q "x509: certificate signed by unknown authority"; then
+        echo "❌ ERROR: SSL Certificate trust issue."
+        echo "   Check that ca.pem is correctly mounted and generated."
+        exit 1
+    fi
+
+    echo "   [$COUNT/$MAX_RETRIES] Connecting..."
+    COUNT=$((COUNT+1))
+done
+
+echo "⚠️  Connection check timed out. Check logs manually:"
+echo "   docker logs -f filebeat"
+
+```
+
+## 6.2 The "Agent" Pattern: Host vs. Sidecar
+
+In the world of container observability, there are two primary ways to collect logs: the **Sidecar Pattern** and the **Host Agent Pattern**. It is important to understand why we have chosen the latter for this architecture.
+
+**The Sidecar Pattern (The Expensive Way)**
+In many Kubernetes tutorials, you will see a "Sidecar" approach. This involves defining a Pod that contains *two* containers: your application (e.g., Jenkins) and a logging agent (Filebeat). The agent shares the storage volume with the app, reads the logs, and ships them.
+
+* **Pros:** Complete isolation.
+* **Cons:** Massive resource overhead. If you have 20 services, you run 20 instances of Filebeat. If each takes 50MB of RAM, you waste 1GB of memory just on shippers.
+
+**The Host Agent Pattern (The Efficient Way)**
+We are using the Host Agent strategy. We run **exactly one** instance of Filebeat for the entire server. This agent sits on the "metal" (conceptually) and watches the Docker storage directory from the outside.
+
+* **The Mechanics:** Docker stores named volumes at `/var/lib/docker/volumes/` on the host Linux filesystem.
+* **The Trick:** By mounting this host directory into Filebeat (`--volume /var/lib/docker/volumes:/host_volumes:ro`), our single agent can peek inside the data directories of Jenkins, GitLab, SonarQube, and Mattermost simultaneously.
+
+This approach reduces our memory footprint significantly (1 agent vs. 10) and simplifies management. We have one configuration file to rule them all, rather than scattering logging configs across ten different repositories.
+
+## 6.3 Access Control: The Root CompromiseYou will notice a controversial flag in our deployment script:
+`--user root`
+
+In almost every security guide, running containers as `root` is considered a vulnerability. However, for a Host Agent, it is a **functional requirement**.
+
+1. **The Permission Barrier:** The directory `/var/lib/docker/volumes` is owned by `root:root` with strict permissions (typically `700` or `750`). If we ran Filebeat as the default `filebeat` user (UID 1000), it would be denied access immediately. It physically cannot enter the directory to read the log files.
+2. **The Mitigation (Read-Only):** To balance the risk of running as root, we use the Docker **Read-Only** flag (`:ro`) on the volume mount:
+```bash
+--volume /var/lib/docker/volumes:/host_volumes:ro
+
+```
+
+This imposes a hard limit at the filesystem level. Even if the Filebeat process were hijacked by an attacker, they could *read* your logs (confidentiality risk), but they could not *delete* your data or *inject* malicious files into your application volumes (integrity risk).
+
+This is the standard privilege model for infrastructure monitoring: the observer must have higher privileges than the observed, but we strip its ability to modify the world it watches.
+
+
+
+## 6.4 The Memory of the Elephant: Persistent Registry
+
+One of the most dangerous pitfalls in deploying Filebeat is failing to persist its "Registry."
+
+Filebeat maintains a small internal database called the **Registry**. This file records exactly how far it has read into every log file it tracks. It stores the unique `inode` of the file and the byte `offset` (e.g., "I have read 10,240 bytes of `jenkins.log`").
+
+In our script, we explicitly handle this state:
+
+```bash
+docker volume create filebeat-data
+...
+--volume filebeat-data:/usr/share/filebeat/data
+
+```
+
+**The Scenario Without Persistence:**
+Imagine we did *not* map this volume.
+
+1. Filebeat starts, reads 5,000 lines of Jenkins logs, and ships them to Elasticsearch.
+2. You restart the Filebeat container to change a config.
+3. The new container starts with a fresh, empty Registry.
+4. It looks at `jenkins.log`, sees 5,000 lines, and thinks, "A new file! I must read this from the beginning."
+5. It re-ships all 5,000 lines. You now have duplicates of every single event in your database.
+
+By mounting the `data` directory to a named Docker volume, we ensure that Filebeat's brain survives a restart. It wakes up, checks the disk, sees it has already processed those 5,000 lines, and waits patiently for line 5,001.
+
+## 6.5 System Visibility (Journald)
+
+Finally, we address the "Blind Spot" of standard Docker logging.
+
+`docker logs` only captures what an application writes to STDOUT (Standard Output). It does **not** capture what happens to the container itself from the Operating System's perspective.
+
+* **Scenario:** Your Jenkins server is under heavy load. It consumes all available RAM. The Linux Kernel's "Out of Memory" (OOM) Killer steps in and terminates the process to save the system.
+* **The Result:** Jenkins is dead. If you look at the Jenkins logs, they just stop. There is no error message because the process was killed before it could write one. You are left guessing.
+
+To solve this, we mount the Host System Journal:
+
+```bash
+--volume /var/log/journal:/var/log/journal:ro \
+--volume /etc/machine-id:/etc/machine-id:ro
+
+```
+
+* **`/var/log/journal`**: This is where modern Linux systems (Ubuntu, CentOS, Debian) store system-level logs in a binary format. Filebeat reads this directly.
+* **`/etc/machine-id`**: This is required for the reader to correctly associate the journal entries with the specific host machine.
+
+By ingesting this stream, we can see the "Meta-Events." In our dashboard, we will be able to correlate a sudden stop in Jenkins logs with a simultaneous `kernel: Out of memory: Kill process 1234 (java)` event from the system log. This context is often the difference between a 5-minute fix and a 5-hour debugging session.

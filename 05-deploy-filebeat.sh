@@ -2,7 +2,7 @@
 
 #
 # -----------------------------------------------------------
-#               05-deploy-filebeat.sh (Final Fixed)
+#               05-deploy-filebeat.sh
 #
 #  The "Collector" Script.
 #  Deploys Filebeat (v9.2.2) to ship logs to Elasticsearch.
