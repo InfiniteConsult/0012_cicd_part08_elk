@@ -1552,3 +1552,84 @@ If Filebeat can't reach Elasticsearch, no data arrives.
 If your pipeline has a syntax error, Elasticsearch might reject the logs entirely.
 
 * *Fix:* Look at the Filebeat logs again. If you see `400 Bad Request` or `pipeline [cicd-logs] missing`, it means the data made it to the door but was turned away. Re-run `04-setup-pipelines.sh` to ensure the logic is loaded.
+
+# Chapter 8: The Dashboard – Visualization
+
+## 8.1 System Health (The Blame Wheel)
+
+Raw logs are useful for debugging, but they are terrible for monitoring. You cannot scroll through thousands of lines of text to guess if the server is healthy. We need a visual signal—a "Traffic Light" that turns Red when things are wrong.
+
+We will build a **Pie Chart** to visualize the distribution of errors across our stack.
+
+1. Open the main menu and go to **Dashboard**.
+2. Click **Create dashboard**.
+3. Click **Create visualization** (This opens the "Lens" editor).
+4. **Configure the Chart:**
+   * **View:** Select **Pie** from the chart type dropdown.
+   * **Metric (Slice Size):** `Count of records`.
+   * **Slice by:** Drag the field `service_name.keyword` onto the "Slices" area.
+5. **The "Unified" Query:**
+   * We have a challenge: Application logs use text levels (`ERROR`, `WARN`), but System logs (Journald) use numbers (`priority 3`, `priority 4`).
+   * In the Search bar at the top, paste this **KQL (Kibana Query Language)** string:
+    ```text
+    log.level.keyword: ("WARN" or "error" or "WARNING") or log.syslog.priority <= 4
+    ```
+   * This query captures *both* types of failures in a single view.
+6. **Save:** Click "Save and return" and name it **"System Health Status"**.
+
+**The Value:**
+If this chart is empty or shows only small slices, you are fine. If you see a massive slice labeled `jenkins`, you know exactly which service is screaming, without reading a single log line.
+
+## 8.2 Intruder Alert (The Security Radar)
+
+Next, we need to secure our perimeter. We want to see if anyone is scanning our Nginx proxy or trying to brute-force URLs. We will use a **Stacked Bar Chart** to show HTTP response codes over time.
+
+1. On your dashboard, click **Create visualization** again.
+2. **Configure the Chart:**
+   * **View:** Select **Bar** (Stacked).
+   * **Horizontal Axis:** Drag `@timestamp` here. Kibana will automatically group data into buckets (e.g., "per minute").
+   * **Vertical Axis:** `Count of records`.
+   * **Break down by:** Drag `http.response.status_code` here.
+3. **Add Filters:**
+   * In the search bar, add: `service_name: "gitlab-nginx"`.
+   * We want to highlight specific anomalies. Click the **Plus (+)** next to the Query bar to add explicit filters for interesting codes: `403` (Forbidden), `502` (Bad Gateway), and `302` (Redirects/Logins).
+4. **Save:** Click "Save and return" and name it **"GitLab Access Patterns"**.
+
+**The Value:**
+
+* **A spike in 302:** Someone is hammering the login page (Brute Force).
+* **A spike in 403:** Someone is scanning for secrets or unauthorized paths.
+* **A spike in 502:** Your GitLab container has likely crashed behind the proxy.
+
+## 8.3 Factory Pulse (Build Frequency)
+
+Finally, we want to see the "Heartbeat" of our factory. We don't want to count logs; we want to count *work*. We will track how often Jenkins provisions a new agent to run a build.
+
+1. Click **Create visualization**.
+2. **Configure the Chart:**
+   * **View:** Select **Area** (Stacked).
+   * **Horizontal Axis:** `@timestamp`.
+   * **Vertical Axis:** `Count of records`.
+3. **The Filter Logic:**
+   * In the search bar, use this query:
+    ```text
+    logger_name.keyword: "hudson.slaves.NodeProvisioner" and message: "*provisioning successfully completed*"
+    ```
+4. **A Note on Accuracy (The Double Log):**
+   * *Observation:* You might notice that for every one build, the count goes up by 2.
+   * *Cause:* The current version of Jenkins logs this specific success message twice (once for the request, once for the completion).
+   * *Impact:* While the absolute number is inflated, the **trend line** is accurate. A spike on this chart still represents a spike in workload. We accept this imperfection rather than over-engineering a fix.
+5. **Save:** Name it **"Build Frequency"**.
+
+## 8.4 Assembling the View
+
+You now have a dashboard with three powerful widgets.
+
+1. **Resize:** Grab the bottom-right corner of the **Security Radar** and **Build Frequency** charts and stretch them across the full width of the screen. Time-series data needs width to be readable.
+2. **Position:** Place the **Health Pie Chart** in the top-left corner.
+3. **Save the Dashboard:**
+   * Click the **Save** button in the top right.
+   * **Title:** `CICD Stack`.
+   * **Store time with dashboard:** Toggle this **On**. This ensures that whenever you open this dashboard, it defaults to the correct time window.
+
+You now have a professional-grade observability dashboard. But if you restart the containers now, this manual work might be lost. In the next chapter, we will ensure this dashboard is saved as code so it can be automatically restored.
