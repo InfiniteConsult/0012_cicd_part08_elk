@@ -1474,8 +1474,6 @@ By ingesting this stream, we can see the "Meta-Events." In our dashboard, we wil
 
 
 
-
-
 # Chapter 7: The Discovery – Verification
 
 ## 7.1 First Contact (The Setup)
@@ -1514,3 +1512,43 @@ When you first log in, Kibana is "blind." It knows it is connected to a database
 6. Click **Save data view to Kibana**.
 
 Kibana now has a lens through which it can see your data.
+
+
+## 7.2 Verifying the Pipeline (The "Discover" Tab)
+
+Now that Kibana can see the data, let's verify that our **Ingest Pipeline** (Chapter 5) is actually working. If the pipeline failed, we would see a giant block of text in the `message` field and nothing else. If it succeeded, that text should be exploded into useful fields.
+
+1. Click on the **Discover** icon (compass) in the left sidebar.
+2. Ensure the date picker (top right) is set to **"Today"** or **"Last 15 minutes"**.
+3. In the search bar, type `service_name: "gitlab-nginx"` and hit Enter.
+
+You should see a list of log events. Click on the small arrow `>` next to any document to expand it into Table/JSON view.
+
+**The "Anatomy of a Log"**
+Look at the JSON structure (like the example below). This is the proof of success:
+
+* **`event.original`**: This contains the raw, ugly text: `172.30.0.5 - - [17/Dec/2025...]`. This is our safety net.
+* **`client.ip`**: The pipeline successfully extracted `172.30.0.5`. This is now a searchable IP address, not just text.
+* **`http.response.status_code`**: It extracted `404`. Because we cast this to a `long` in our pipeline, we can now build charts aggregating "Top Error Codes."
+* **`@timestamp`**: Notice the time is `2025-12-17T09:51:49.000Z`. The pipeline took the Nginx format (`17/Dec/2025...`) and standardized it to UTC ISO8601.
+
+If you see these fields, your "Brain" is correctly parsing the "Voice" of your infrastructure.
+
+## 7.3 Troubleshooting Common Issues
+
+If you navigate to Discover and see... **nothing**, don't panic. This is the "No Data" state, and it usually has three simple causes.
+
+**1. The Time Trap**
+Kibana defaults to "Last 15 minutes." If your logs are from an hour ago (or if your server time is drifting), you won't see them.
+
+* *Fix:* Set the time picker to **"Last 24 hours"**.
+
+**2. The Connection Gap**
+If Filebeat can't reach Elasticsearch, no data arrives.
+
+* *Fix:* Check the Filebeat logs: `docker logs filebeat`. Look for `Connection refused`. If you see this, check that Elasticsearch is healthy (`docker ps`) and that you are using the correct password.
+
+**3. The Pipeline Reject**
+If your pipeline has a syntax error, Elasticsearch might reject the logs entirely.
+
+* *Fix:* Look at the Filebeat logs again. If you see `400 Bad Request` or `pipeline [cicd-logs] missing`, it means the data made it to the door but was turned away. Re-run `04-setup-pipelines.sh` to ensure the logic is loaded.
