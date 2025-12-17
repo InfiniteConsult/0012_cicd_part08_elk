@@ -1471,3 +1471,46 @@ To solve this, we mount the Host System Journal:
 * **`/etc/machine-id`**: This is required for the reader to correctly associate the journal entries with the specific host machine.
 
 By ingesting this stream, we can see the "Meta-Events." In our dashboard, we will be able to correlate a sudden stop in Jenkins logs with a simultaneous `kernel: Out of memory: Kill process 1234 (java)` event from the system log. This context is often the difference between a 5-minute fix and a 5-hour debugging session.
+
+
+
+
+
+# Chapter 7: The Discovery – Verification
+
+## 7.1 First Contact (The Setup)
+
+The scripts have finished running. The containers are green. Now comes the moment of truth: seeing your data.
+
+Before we open the browser, we must ensure your computer knows how to find the services. Our scripts used specific hostnames (`kibana.cicd.local`) which makes handling SSL certificates and networking much cleaner than using raw IP addresses.
+
+**1. Update Your Hosts File**
+On your host machine (the one running the browser), open your `/etc/hosts` file (or `C:\Windows\System32\drivers\etc\hosts` on Windows) and add the following line:
+
+```text
+127.0.0.1  elasticsearch.cicd.local kibana.cicd.local
+
+```
+
+**2. The Login**
+Navigate to **`https://kibana.cicd.local:5601`**.
+
+You will be greeted by the Elastic login screen.
+
+* **Username:** `elastic`
+* **Password:** The value you generated in `cicd.env` (look for `ELASTIC_PASSWORD`).
+
+**3. Creating the Data View**
+When you first log in, Kibana is "blind." It knows it is connected to a database, but it doesn't know *which* tables (indices) you care about. We need to define a **Data View** (formerly known as an Index Pattern).
+
+1. Open the main menu (hamburger icon) and go to **Stack Management > Data Views**.
+2. Click **Create data view**.
+3. **Name:** Give it a friendly name like `CICD Logs`.
+4. **Index pattern:** Enter `filebeat-*`.
+   * *Why?* Filebeat creates a new index every day (e.g., `filebeat-9.2.2-2025.12.17`). By using the wildcard `*`, we tell Kibana to look at *all* existing and future Filebeat indices.
+   * *Confirmation:* You should see a success message on the right listing the matching indices (e.g., `filebeat-9.2.2-2025...`).
+5. **Timestamp field:** Select `@timestamp`.
+   * *Critical:* This tells Kibana which field represents "Time." If you pick the wrong field, your time-series charts will be broken.
+6. Click **Save data view to Kibana**.
+
+Kibana now has a lens through which it can see your data.
