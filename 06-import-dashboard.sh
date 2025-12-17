@@ -30,8 +30,7 @@ if [ ! -f "$DASHBOARD_FILE" ]; then
 fi
 
 echo "⏳ Waiting for Kibana to be ready..."
-# We use -k (insecure) because of our self-signed certs
-until curl -s -k "$KIBANA_URL/api/status" | grep -q "available"; do
+until curl -s "$KIBANA_URL/api/status" | grep -q "available"; do
   echo -n "."
   sleep 5
 done
