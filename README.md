@@ -1736,3 +1736,110 @@ We explicitly set `overwrite=true`. This makes the script **Idempotent**. You ca
 Kibana has strict security protections against Cross-Site Request Forgery. Even though we are authenticating with a valid password, the API will reject any write operation that lacks this specific header. It is a mandatory handshake that proves the request is intentional.
 
 With this script in your toolkit, your observability stack is now as reproducible as the applications it monitors.
+
+
+# Chapter 10: Validation – The Stress Test
+
+## 10.1 The "Fire Drill" Philosophy
+
+We have built a complex machine. We have containers, pipelines, secure certificate authorities, and dashboards. But right now, it is sitting idle. A monitoring system that looks good when nothing is happening is useless; you need to know what it looks like when the world is burning.
+
+In this final chapter, we are going to attack our own infrastructure. We will execute a "Fire Drill" to prove that:
+
+1. **Filebeat** can handle a sudden flood of events (Backpressure).
+2. **The Pipeline** correctly parses logs even under load.
+3. **The Dashboard** translates this chaos into a clear, readable signal.
+
+## 10.2 The Nuclear Option (The Script)
+
+Create `99-stress-test.sh`. This script is designed to be noisy. It uses standard Linux tools to generate two distinct types of failures: **System Stability** failures and **Network Security** events.
+
+```bash
+#!/usr/bin/env bash
+
+#
+# -----------------------------------------------------------
+#           99-stress-test.sh
+#
+#  Generates 1000 System Errors and 1000 Access Events
+#  to stress-test ELK dashboards.
+# -----------------------------------------------------------
+
+set -e
+
+echo "🔥 Starting ELK 'Nuclear' Stress Test..."
+echo "---------------------------------"
+
+# 1. Generate 1000 System Events (Blame Wheel -> System Slice)
+echo "1. Injecting 1000 System Errors & Warnings..."
+for i in {1..1000}; do
+    logger -p syslog.err "CICD-STRESS-TEST: Critical Database Failure #$i"
+    logger -p syslog.warning "CICD-STRESS-TEST: Memory Threshold Exceeded #$i"
+    
+    # Progress bar effect (print a dot every 50 events)
+    ((i % 50 == 0)) && echo -n "."
+done
+echo " Done."
+
+echo "---------------------------------"
+
+# 2. Generate 1000 Access Events (Security Radar -> 302 Spike)
+# We target Port 10300 (GitLab HTTPS).
+# Expect 302 (Redirect to Login) or 401/403 depending on the endpoint.
+echo "2. Simulating 1000 Access Attempts on GitLab (Port 10300)..."
+for i in {1..1000}; do
+    # Hit the protected admin endpoint on the correct mapped port
+    curl -s -o /dev/null "https://gitlab.cicd.local:10300/admin"
+    
+    ((i % 50 == 0)) && echo -n "."
+done
+echo " Done."
+
+echo "---------------------------------"
+echo "🎉 Stress Test Complete."
+echo "   Go to Kibana -> Refresh Dashboard (Last 15 Minutes)"
+echo "   You should see a massive spike in '302' events."
+
+```
+
+## 10.3 Vector 1: The System Flood (Testing Journald)
+
+The first loop uses the `logger` command. This tool writes directly to the Linux System Journal, bypassing Docker completely.
+
+**The Test:**
+We are injecting 1,000 messages with specific severity levels (`syslog.err` and `syslog.warning`).
+
+**The Visual Result:**
+Look at your **"System Health Status"** Pie Chart.
+
+* **Before:** It was likely empty or had thin slices, as a healthy system generates very few errors.
+* **After:** You will see a massive new slice appear, dominating the chart. This slice represents the **Host System**.
+* *Why this matters:* We filtered this chart to only show "Bad Things" (`WARN` or `ERROR`). The fact that this slice appeared instantly proves that our **Unified Query** works: it successfully caught the `syslog.priority` signal from the host, even though it didn't come from a container.
+
+## 10.4 Vector 2: The Network Flood (Testing Nginx)
+
+The second loop uses `curl` to hit the GitLab Admin interface (`/admin`). Since our script does not provide a session cookie, GitLab rejects us.
+
+**The Test:**
+We fire 1,000 requests at the Nginx Reverse Proxy.
+
+**The Visual Result:**
+Look at your **"GitLab Access Patterns"** Bar Chart.
+
+* **The Wall:** You will see a massive vertical spike.
+* **The Code:** The bars will be colored for status code **302** (Redirect).
+* *Why this matters:* If we had failed to configure the **Ingest Pipeline** (Chapter 5) correctly, these logs would just be text. Kibana wouldn't know they were "302" errors. The fact that you can see a "302" bar proves the regex parser extracted `http.response.status_code` correctly.
+
+## 10.5 Conclusion: The Single Pane of Glass
+
+Congratulations. You have successfully deployed a production-grade Observability Stack for a CI/CD environment.
+
+Let's review what we achieved:
+
+1. **Architecture:** We built a secure, single-node architecture using custom Docker networks and TLS encryption.
+2. **Ingestion:** We used **Filebeat** as a lightweight "Host Agent" to collect data from both containers (Docker volumes) and the OS (Journald).
+3. **Parsing:** We replaced the heavy Logstash with lean **Ingest Pipelines**, moving the logic into the database to save RAM.
+4. **Persistence:** We automated the dashboard recovery with `export.ndjson`, ensuring our work is never lost.
+5. **Validation:** We proved it works by attacking it.
+
+You have moved beyond "SSH and Grep." You now have a **Single Pane of Glass**—a central nervous system that tells you the health, security, and workload of your factory in real-time. This is the foundation of modern DevOps.

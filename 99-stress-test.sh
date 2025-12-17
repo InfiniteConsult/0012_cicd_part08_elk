@@ -32,7 +32,7 @@ echo "---------------------------------"
 echo "2. Simulating 1000 Access Attempts on GitLab (Port 10300)..."
 for i in {1..1000}; do
     # Hit the protected admin endpoint on the correct mapped port
-    curl -k -s -o /dev/null "https://gitlab.cicd.local:10300/admin"
+    curl -s -o /dev/null "https://gitlab.cicd.local:10300/admin"
     
     ((i % 50 == 0)) && echo -n "."
 done
